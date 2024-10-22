@@ -497,6 +497,179 @@ static void present() {
     SDL_Flip(state.screen);
 }
 
+bool check_collision(v2 current_pos, v2 proposed_pos, int sector_id) {
+    const struct sector *sector = &state.sectors.arr[sector_id];
+
+    // Movement vector
+    v2 movement = { proposed_pos.x - current_pos.x, proposed_pos.y - current_pos.y };
+
+    for (usize i = 0; i < sector->nwalls; i++) {
+        const struct wall *wall = &state.walls.arr[sector->firstwall + i];
+
+        // Skip portal walls
+        if (wall->portal) {
+            continue;
+        }
+
+        // Wall segment
+        v2 wall_a = v2i_to_v2(wall->a);
+        v2 wall_b = v2i_to_v2(wall->b);
+
+        // Check if movement vector intersects wall segment
+        v2 intersection = intersect_segs(current_pos, proposed_pos, wall_a, wall_b);
+
+        if (!isnan(intersection.x) && !isnan(intersection.y)) {
+            // Collision detected
+            return true;
+        }
+    }
+
+    // No collision
+    return false;
+}
+
+void move_player(v2 movement) {
+    v2 current_pos = state.camera.pos;
+    v2 adjusted_movement = movement;
+
+    int sector_id = state.camera.sector;
+    const struct sector *sector = &state.sectors.arr[sector_id];
+
+    const int MAX_ITERATIONS = 5; // Prevent infinite loops
+    int iteration = 0;
+
+    const float player_radius = 0.2f; 
+
+    while (iteration < MAX_ITERATIONS) {
+        iteration++;
+
+        v2 proposed_pos = {
+            current_pos.x + adjusted_movement.x,
+            current_pos.y + adjusted_movement.y
+        };
+
+        bool collision_detected = false;
+        v2 collision_normal = {0, 0};
+
+        for (usize i = 0; i < sector->nwalls; i++) {
+            const struct wall *wall = &state.walls.arr[sector->firstwall + i];
+
+            // Skip portal walls
+            if (wall->portal) {
+                continue;
+            }
+
+            // Wall segment
+            v2 wall_a = v2i_to_v2(wall->a);
+            v2 wall_b = v2i_to_v2(wall->b);
+
+            // Collision detection with wall segment
+            v2 wall_dir = { wall_b.x - wall_a.x, wall_b.y - wall_a.y };
+            float wall_length = length(wall_dir);
+            if (wall_length == 0) {
+                continue;
+            }
+            wall_dir.x /= wall_length;
+            wall_dir.y /= wall_length;
+
+            float t = ((proposed_pos.x - wall_a.x) * wall_dir.x + (proposed_pos.y - wall_a.y) * wall_dir.y);
+            t = clamp(t, 0.0f, wall_length);
+
+            v2 closest_point = {
+                wall_a.x + wall_dir.x * t,
+                wall_a.y + wall_dir.y * t
+            };
+
+            v2 diff = {
+                proposed_pos.x - closest_point.x,
+                proposed_pos.y - closest_point.y
+            };
+            float dist_sq = diff.x * diff.x + diff.y * diff.y;
+
+            if (dist_sq < player_radius * player_radius) {
+                // Collision detected with a solid wall
+                collision_detected = true;
+
+                // Compute the collision normal
+                float dist = sqrtf(dist_sq);
+                if (dist == 0) {
+                    // Prevent division by zero; use wall normal
+                    v2 wall_normal = { -wall_dir.y, wall_dir.x };
+                    collision_normal.x += wall_normal.x;
+                    collision_normal.y += wall_normal.y;
+                } else {
+                    collision_normal.x += diff.x / dist;
+                    collision_normal.y += diff.y / dist;
+                }
+            }
+        }
+
+        // Handle portal-specific logic for wall sliding
+        for (usize i = 0; i < sector->nwalls; i++) {
+            const struct wall *wall = &state.walls.arr[sector->firstwall + i];
+
+            // Only process portal walls here
+            if (!wall->portal) {
+                continue;
+            }
+
+            // Wall segment
+            v2 wall_a = v2i_to_v2(wall->a);
+            v2 wall_b = v2i_to_v2(wall->b);
+
+            // Treat portals as passable
+            v2 wall_dir = { wall_b.x - wall_a.x, wall_b.y - wall_a.y };
+            float wall_length = length(wall_dir);
+            if (wall_length == 0) {
+                continue;
+            }
+            wall_dir.x /= wall_length;
+            wall_dir.y /= wall_length;
+
+            float t = ((proposed_pos.x - wall_a.x) * wall_dir.x + (proposed_pos.y - wall_a.y) * wall_dir.y);
+            t = clamp(t, 0.0f, wall_length);
+
+            v2 closest_point = {
+                wall_a.x + wall_dir.x * t,
+                wall_a.y + wall_dir.y * t
+            };
+
+            v2 diff = {
+                proposed_pos.x - closest_point.x,
+                proposed_pos.y - closest_point.y
+            };
+            float dist_sq = diff.x * diff.x + diff.y * diff.y;
+
+            if (dist_sq < player_radius * player_radius) {
+                // Portal collision detected
+                collision_detected = false;
+                break;
+            }
+        }
+
+        if (collision_detected) {
+            // Normalize the accumulated normal
+            collision_normal = normalize(collision_normal);
+
+            // Remove the component of movement in the direction of the collision normal
+            float dot_prod = adjusted_movement.x * collision_normal.x + adjusted_movement.y * collision_normal.y;
+            adjusted_movement.x -= dot_prod * collision_normal.x;
+            adjusted_movement.y -= dot_prod * collision_normal.y;
+
+            // Continue to next iteration to check for additional collisions
+        } else {
+            // No collision; update player's position and exit loop
+            state.camera.pos.x += adjusted_movement.x;
+            state.camera.pos.y += adjusted_movement.y;
+            break;
+        }
+    }
+
+    if (iteration == MAX_ITERATIONS) {
+        // May add something here later.
+    }
+}
+
 int main(int argc, char *argv[]) {
     ASSERT(
         !SDL_Init(SDL_INIT_VIDEO),
@@ -556,19 +729,21 @@ int main(int argc, char *argv[]) {
         state.camera.anglecos = cos(state.camera.angle);
         state.camera.anglesin = sin(state.camera.angle);
 
+        // Compute movement vector
+        v2 movement = {0, 0};
+
         if (keystate[SDLK_UP]) {
-            state.camera.pos = (v2) {
-                state.camera.pos.x + (move_speed * state.camera.anglecos),
-                state.camera.pos.y + (move_speed * state.camera.anglesin),
-            };
+            movement.x += move_speed * state.camera.anglecos;
+            movement.y += move_speed * state.camera.anglesin;
         }
 
         if (keystate[SDLK_DOWN]) {
-            state.camera.pos = (v2) {
-                state.camera.pos.x - (move_speed * state.camera.anglecos),
-                state.camera.pos.y - (move_speed * state.camera.anglesin),
-            };
+            movement.x -= move_speed * state.camera.anglecos;
+            movement.y -= move_speed * state.camera.anglesin;
         }
+
+        // Move the player with collision detection and wall sliding
+        move_player(movement);
 
         if (keystate[SDLK_F1]) {
             state.sleepy = true;

@@ -232,14 +232,16 @@ static void verline(int x, int y0, int y1, u32 color) {
 
 // point is in sector if it is on the left side of all walls
 static bool point_in_sector(const struct sector *sector, v2 p) {
+    const float EPSILON = 1e-6f;
+
     for (usize i = 0; i < sector->nwalls; i++) {
         const struct wall *wall = &state.walls.arr[sector->firstwall + i];
+        float side = point_side(p, v2i_to_v2(wall->a), v2i_to_v2(wall->b));
 
-        if (point_side(p, v2i_to_v2(wall->a), v2i_to_v2(wall->b)) > 0) {
+        if (side > EPSILON) {
             return false;
         }
     }
-
     return true;
 }
 
@@ -497,17 +499,49 @@ static void present() {
     SDL_Flip(state.screen);
 }
 
-bool check_collision(v2 current_pos, v2 proposed_pos, int sector_id) {
-    const struct sector *sector = &state.sectors.arr[sector_id];
+int find_sector(v2 pos, int start_sector) {
+    enum { QUEUE_MAX = 64 };
+    int queue[QUEUE_MAX];
+    int head = 0, tail = 0;
+    bool visited[SECTOR_MAX] = {0};
 
-    // Movement vector
-    v2 movement = { proposed_pos.x - current_pos.x, proposed_pos.y - current_pos.y };
+    queue[tail++] = start_sector;
+    visited[start_sector] = true;
+
+    while (head != tail) {
+        int sector_id = queue[head++];
+        const struct sector *sector = &state.sectors.arr[sector_id];
+
+        if (point_in_sector(sector, pos)) {
+            return sector_id;
+        }
+
+        for (usize i = 0; i < sector->nwalls; i++) {
+            const struct wall *wall = &state.walls.arr[sector->firstwall + i];
+            if (wall->portal && !visited[wall->portal]) {
+                visited[wall->portal] = true;
+                queue[tail++] = wall->portal;
+                if (tail == QUEUE_MAX) {
+                    fprintf(stderr, "find_sector: Queue overflow\n");
+                    return SECTOR_NONE;
+                }
+            }
+        }
+    }
+    return SECTOR_NONE;
+}
+
+bool resolve_collision(v2 *position, int sector_id) {
+    const struct sector *sector = &state.sectors.arr[sector_id];
+    const float player_radius = 0.2f;
+
+    bool collision_detected = false;
 
     for (usize i = 0; i < sector->nwalls; i++) {
         const struct wall *wall = &state.walls.arr[sector->firstwall + i];
 
-        // Skip portal walls
         if (wall->portal) {
+            // Skip portal walls in collision detection
             continue;
         }
 
@@ -515,165 +549,93 @@ bool check_collision(v2 current_pos, v2 proposed_pos, int sector_id) {
         v2 wall_a = v2i_to_v2(wall->a);
         v2 wall_b = v2i_to_v2(wall->b);
 
-        // Check if movement vector intersects wall segment
-        v2 intersection = intersect_segs(current_pos, proposed_pos, wall_a, wall_b);
+        // Collision detection with walls (circle-line collision)
+        v2 wall_dir = { wall_b.x - wall_a.x, wall_b.y - wall_a.y };
+        float wall_length = length(wall_dir);
+        if (wall_length == 0) continue;
+        wall_dir = normalize(wall_dir);
 
-        if (!isnan(intersection.x) && !isnan(intersection.y)) {
+        float t = ((*position).x - wall_a.x) * wall_dir.x + ((*position).y - wall_a.y) * wall_dir.y;
+        t = clamp(t, 0.0f, wall_length);
+
+        v2 closest_point = {
+            wall_a.x + wall_dir.x * t,
+            wall_a.y + wall_dir.y * t
+        };
+
+        v2 diff = {
+            (*position).x - closest_point.x,
+            (*position).y - closest_point.y
+        };
+        float dist_sq = diff.x * diff.x + diff.y * diff.y;
+
+        if (dist_sq < player_radius * player_radius) {
             // Collision detected
-            return true;
+            collision_detected = true;
+
+            // Compute the minimum translation vector (MTV)
+            float dist = sqrtf(dist_sq);
+            float penetration_depth = player_radius - dist;
+
+            v2 normal;
+            if (dist > 0) {
+                normal.x = diff.x / dist;
+                normal.y = diff.y / dist;
+            } else {
+                // Player is exactly at the wall line, use wall normal
+                normal.x = -wall_dir.y;
+                normal.y = wall_dir.x;
+            }
+
+            // Move position out of collision
+            (*position).x += normal.x * penetration_depth;
+            (*position).y += normal.y * penetration_depth;
         }
     }
 
-    // No collision
-    return false;
+    return collision_detected;
 }
 
 void move_player(v2 movement) {
     v2 current_pos = state.camera.pos;
-    v2 adjusted_movement = movement;
+    v2 proposed_pos = {
+        current_pos.x + movement.x,
+        current_pos.y + movement.y
+    };
 
     int sector_id = state.camera.sector;
-    const struct sector *sector = &state.sectors.arr[sector_id];
 
-    const int MAX_ITERATIONS = 5; // Prevent infinite loops
+    // Update player's position
+    state.camera.pos = proposed_pos;
+
+    // Resolve any collisions at the new position
+    const int max_iterations = 5;
     int iteration = 0;
-
-    const float player_radius = 0.2f; 
-
-    while (iteration < MAX_ITERATIONS) {
+    while (iteration < max_iterations) {
         iteration++;
-
-        v2 proposed_pos = {
-            current_pos.x + adjusted_movement.x,
-            current_pos.y + adjusted_movement.y
-        };
-
-        bool collision_detected = false;
-        v2 collision_normal = {0, 0};
-
-        for (usize i = 0; i < sector->nwalls; i++) {
-            const struct wall *wall = &state.walls.arr[sector->firstwall + i];
-
-            // Skip portal walls
-            if (wall->portal) {
-                continue;
-            }
-
-            // Wall segment
-            v2 wall_a = v2i_to_v2(wall->a);
-            v2 wall_b = v2i_to_v2(wall->b);
-
-            // Collision detection with wall segment
-            v2 wall_dir = { wall_b.x - wall_a.x, wall_b.y - wall_a.y };
-            float wall_length = length(wall_dir);
-            if (wall_length == 0) {
-                continue;
-            }
-            wall_dir.x /= wall_length;
-            wall_dir.y /= wall_length;
-
-            float t = ((proposed_pos.x - wall_a.x) * wall_dir.x + (proposed_pos.y - wall_a.y) * wall_dir.y);
-            t = clamp(t, 0.0f, wall_length);
-
-            v2 closest_point = {
-                wall_a.x + wall_dir.x * t,
-                wall_a.y + wall_dir.y * t
-            };
-
-            v2 diff = {
-                proposed_pos.x - closest_point.x,
-                proposed_pos.y - closest_point.y
-            };
-            float dist_sq = diff.x * diff.x + diff.y * diff.y;
-
-            if (dist_sq < player_radius * player_radius) {
-                // Collision detected with a solid wall
-                collision_detected = true;
-
-                // Compute the collision normal
-                float dist = sqrtf(dist_sq);
-                if (dist == 0) {
-                    // Prevent division by zero; use wall normal
-                    v2 wall_normal = { -wall_dir.y, wall_dir.x };
-                    collision_normal.x += wall_normal.x;
-                    collision_normal.y += wall_normal.y;
-                } else {
-                    collision_normal.x += diff.x / dist;
-                    collision_normal.y += diff.y / dist;
-                }
-            }
-        }
-
-        // Handle portal-specific logic for wall sliding
-        for (usize i = 0; i < sector->nwalls; i++) {
-            const struct wall *wall = &state.walls.arr[sector->firstwall + i];
-
-            // Only process portal walls here
-            if (!wall->portal) {
-                continue;
-            }
-
-            // Wall segment
-            v2 wall_a = v2i_to_v2(wall->a);
-            v2 wall_b = v2i_to_v2(wall->b);
-
-            // Treat portals as passable
-            v2 wall_dir = { wall_b.x - wall_a.x, wall_b.y - wall_a.y };
-            float wall_length = length(wall_dir);
-            if (wall_length == 0) {
-                continue;
-            }
-            wall_dir.x /= wall_length;
-            wall_dir.y /= wall_length;
-
-            float t = ((proposed_pos.x - wall_a.x) * wall_dir.x + (proposed_pos.y - wall_a.y) * wall_dir.y);
-            t = clamp(t, 0.0f, wall_length);
-
-            v2 closest_point = {
-                wall_a.x + wall_dir.x * t,
-                wall_a.y + wall_dir.y * t
-            };
-
-            v2 diff = {
-                proposed_pos.x - closest_point.x,
-                proposed_pos.y - closest_point.y
-            };
-            float dist_sq = diff.x * diff.x + diff.y * diff.y;
-
-            if (dist_sq < player_radius * player_radius) {
-                // Portal collision detected
-                collision_detected = false;
-                break;
-            }
-        }
-
-        if (collision_detected) {
-            // Normalize the accumulated normal
-            collision_normal = normalize(collision_normal);
-
-            // Remove the component of movement in the direction of the collision normal
-            float dot_prod = adjusted_movement.x * collision_normal.x + adjusted_movement.y * collision_normal.y;
-            adjusted_movement.x -= dot_prod * collision_normal.x;
-            adjusted_movement.y -= dot_prod * collision_normal.y;
-
-            // Continue to next iteration to check for additional collisions
-        } else {
-            // No collision; update player's position and exit loop
-            state.camera.pos.x += adjusted_movement.x;
-            state.camera.pos.y += adjusted_movement.y;
+        bool collision = resolve_collision(&state.camera.pos, sector_id);
+        if (!collision) {
             break;
         }
     }
 
-    if (iteration == MAX_ITERATIONS) {
-        // May add something here later.
+    // After resolving collisions, check if the player is inside a sector
+    if (!point_in_sector(&state.sectors.arr[sector_id], state.camera.pos)) {
+        // Try to find the sector the player is now in
+        int new_sector_id = find_sector(state.camera.pos, sector_id);
+        if (new_sector_id != SECTOR_NONE) {
+            state.camera.sector = new_sector_id;
+        } else {
+            // Player is not in any sector, revert to the previous position
+            state.camera.pos = current_pos;
+        }
     }
 }
 
 int main(int argc, char *argv[]) {
     ASSERT(
         !SDL_Init(SDL_INIT_VIDEO),
-        "SDL failed to initialize: %s",
+        "SDL failed to initialize: %s\n",
         SDL_GetError());
 
     state.screen = SDL_SetVideoMode(1280, 720, 32, SDL_SWSURFACE);
@@ -691,10 +653,10 @@ int main(int argc, char *argv[]) {
     int ret = 0;
     ASSERT(
         !(ret = load_sectors("level.txt")),
-        "error while loading sectors: %d",
+        "error while loading sectors: %d\n",
         ret);
     printf(
-        "loaded %zu sectors with %zu walls",
+        "loaded %zu sectors with %zu walls\n",
         state.sectors.n,
         state.walls.n);
 
@@ -747,57 +709,6 @@ int main(int argc, char *argv[]) {
 
         if (keystate[SDLK_F1]) {
             state.sleepy = true;
-        }
-
-        // update player sector
-        {
-            // BFS neighbors in a circular queue, player is likely to be in one
-            // of the neighboring sectors
-            enum { QUEUE_MAX = 64 };
-            int
-                queue[QUEUE_MAX] = { state.camera.sector },
-                i = 0,
-                n = 1,
-                found = SECTOR_NONE;
-
-            while (n != 0) {
-                // get front of queue and advance to next
-                const int id = queue[i];
-                i = (i + 1) % (QUEUE_MAX);
-                n--;
-
-                const struct sector *sector = &state.sectors.arr[id];
-
-                if (point_in_sector(sector, state.camera.pos)) {
-                    found = id;
-                    break;
-                }
-
-                // check neighbors
-                for (usize j = 0; j < sector->nwalls; j++) {
-                    const struct wall *wall =
-                        &state.walls.arr[sector->firstwall + j];
-
-                    if (wall->portal) {
-                        if (n == QUEUE_MAX) {
-                            fprintf(stderr, "out of queue space!");
-                            goto done;
-                        }
-
-                        queue[(i + n) % QUEUE_MAX] = wall->portal;
-                        n++;
-                    }
-                }
-            }
-
-
-done:
-            if (!found) {
-                fprintf(stderr, "player is not in a sector!");
-                state.camera.sector = 1;
-            } else {
-                state.camera.sector = found;
-            }
         }
 
         memset(state.pixels, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 4);

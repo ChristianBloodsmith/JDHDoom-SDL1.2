@@ -23,13 +23,15 @@ typedef ssize_t  isize;
 #define PI 3.14159265359f
 #define TAU (2.0f * PI)
 #define PI_2 (PI / 2.0f)
+#define PI_3 (PI / 3.0f)
 #define PI_4 (PI / 4.0f)
 
 #define DEG2RAD(_d) ((_d) * (PI / 180.0f))
 #define RAD2DEG(_d) ((_d) * (180.0f / PI))
 
-#define SCREEN_WIDTH 384
-#define SCREEN_HEIGHT 216
+#define SCREEN_WIDTH 320
+#define SCREEN_HEIGHT 200
+#define FPS 60
 
 #define EYE_Z 1.65f
 #define HFOV DEG2RAD(90.0f)
@@ -124,7 +126,7 @@ static struct {
 
     struct {
         v2 pos;
-        f32 angle, anglecos, anglesin;
+        f32 angle, anglecos, anglesin, pitch, height;
         int sector;
     } camera;
 
@@ -251,11 +253,11 @@ static void render() {
         state.y_lo[i] = 0;
     }
 
-    // track if sector has already been drawn
+    // Track if sector has already been drawn
     bool sectdraw[SECTOR_MAX];
     memset(sectdraw, 0, sizeof(sectdraw));
 
-    // calculate edges of near/far planes (looking down +Y axis)
+    // Calculate edges of near/far planes (looking down +Y axis)
     const v2
         zdl = rotate(((v2) { 0.0f, 1.0f }), +(HFOV / 2.0f)),
         zdr = rotate(((v2) { 0.0f, 1.0f }), -(HFOV / 2.0f)),
@@ -273,7 +275,7 @@ static void render() {
     };
 
     while (queue.n != 0) {
-        // grab tail of queue
+        // Grab tail of queue
         struct queue_entry entry = queue.arr[--queue.n];
 
         if (sectdraw[entry.id]) {
@@ -288,26 +290,25 @@ static void render() {
             const struct wall *wall =
                 &state.walls.arr[sector->firstwall + i];
 
-            // translate relative to player and rotate points around player's view
+            // Translate relative to player and rotate points around player's view
             const v2
                 op0 = world_pos_to_camera(v2i_to_v2(wall->a)),
                 op1 = world_pos_to_camera(v2i_to_v2(wall->b));
 
-            // wall clipped pos
+            // Wall clipped positions
             v2 cp0 = op0, cp1 = op1;
 
-            // both are negative -> wall is entirely behind player
+            // Both are negative -> wall is entirely behind player
             if (cp0.y <= 0 && cp1.y <= 0) {
                 continue;
             }
 
-            // angle-clip against view frustum
+            // Angle-clip against view frustum
             f32
                 ap0 = normalize_angle(atan2(cp0.y, cp0.x) - PI_2),
                 ap1 = normalize_angle(atan2(cp1.y, cp1.x) - PI_2);
 
-            // clip against view frustum if both angles are not clearly within
-            // HFOV
+            // Clip against view frustum if both angles are not clearly within HFOV
             if (cp0.y < ZNEAR
                 || cp1.y < ZNEAR
                 || ap0 > +(HFOV / 2)
@@ -316,7 +317,7 @@ static void render() {
                     il = intersect_segs(cp0, cp1, znl, zfl),
                     ir = intersect_segs(cp0, cp1, znr, zfr);
 
-                // recompute angles if points change
+                // Recompute angles if points change
                 if (!isnan(il.x)) {
                     cp0 = il;
                     ap0 = normalize_angle(atan2(cp0.y, cp0.x) - PI_2);
@@ -337,19 +338,19 @@ static void render() {
                 continue;
             }
 
-            // "true" xs before portal clamping
+            // "True" xs before portal clamping
             const int
                 tx0 = screen_angle_to_x(ap0),
                 tx1 = screen_angle_to_x(ap1);
 
-            // bounds check against portal window
+            // Bounds check against portal window
             if (tx0 > entry.x1) { continue; }
             if (tx1 < entry.x0) { continue; }
 
             const int wallshade =
                 16 * (sin(atan2f(
                     wall->b.x - wall->a.x,
-                    wall->b.y - wall->b.y)) + 1.0f);
+                    wall->b.y - wall->a.y)) + 1.0f);
 
             const int
                 x0 = clamp(tx0, entry.x0, entry.x1),
@@ -363,19 +364,26 @@ static void render() {
                 nz_ceil =
                     wall->portal ? state.sectors.arr[wall->portal].zceil : 0;
 
-            const f32
-                sy0 = ifnan((VFOV * SCREEN_HEIGHT) / cp0.y, 1e10),
-                sy1 = ifnan((VFOV * SCREEN_HEIGHT) / cp1.y, 1e10);
+            // Calculate pitch shift
+            float pitch_shift = (SCREEN_HEIGHT / 2) * tanf(state.camera.pitch);
 
+            // Adjust sy0 and sy1 to account for camera pitch
+            const f32
+                sy0 = ifnan((VFOV * SCREEN_HEIGHT) / cp0.y, 1e10f),
+                sy1 = ifnan((VFOV * SCREEN_HEIGHT) / cp1.y, 1e10f);
+            
+            const f32 ADEYE_Z = EYE_Z + state.sectors.arr[state.camera.sector].zfloor;
+
+            // Vertical positions adjusted with pitch_shift
             const int
-                yf0  = (SCREEN_HEIGHT / 2) + (int) (( z_floor - EYE_Z) * sy0),
-                yc0  = (SCREEN_HEIGHT / 2) + (int) (( z_ceil  - EYE_Z) * sy0),
-                yf1  = (SCREEN_HEIGHT / 2) + (int) (( z_floor - EYE_Z) * sy1),
-                yc1  = (SCREEN_HEIGHT / 2) + (int) (( z_ceil  - EYE_Z) * sy1),
-                nyf0 = (SCREEN_HEIGHT / 2) + (int) ((nz_floor - EYE_Z) * sy0),
-                nyc0 = (SCREEN_HEIGHT / 2) + (int) ((nz_ceil  - EYE_Z) * sy0),
-                nyf1 = (SCREEN_HEIGHT / 2) + (int) ((nz_floor - EYE_Z) * sy1),
-                nyc1 = (SCREEN_HEIGHT / 2) + (int) ((nz_ceil  - EYE_Z) * sy1),
+                yf0  = (SCREEN_HEIGHT / 2) + (int)(( z_floor - ADEYE_Z) * sy0) - pitch_shift,
+                yc0  = (SCREEN_HEIGHT / 2) + (int)(( z_ceil  - ADEYE_Z) * sy0) - pitch_shift,
+                yf1  = (SCREEN_HEIGHT / 2) + (int)(( z_floor - ADEYE_Z) * sy1) - pitch_shift,
+                yc1  = (SCREEN_HEIGHT / 2) + (int)(( z_ceil  - ADEYE_Z) * sy1) - pitch_shift,
+                nyf0 = (SCREEN_HEIGHT / 2) + (int)((nz_floor - ADEYE_Z) * sy0) - pitch_shift,
+                nyc0 = (SCREEN_HEIGHT / 2) + (int)((nz_ceil  - ADEYE_Z) * sy0) - pitch_shift,
+                nyf1 = (SCREEN_HEIGHT / 2) + (int)((nz_floor - ADEYE_Z) * sy1) - pitch_shift,
+                nyc1 = (SCREEN_HEIGHT / 2) + (int)((nz_ceil  - ADEYE_Z) * sy1) - pitch_shift,
                 txd = tx1 - tx0,
                 yfd = yf1 - yf0,
                 ycd = yc1 - yc0,
@@ -385,19 +393,17 @@ static void render() {
             for (int x = x0; x <= x1; x++) {
                 int shade = x == x0 || x == x1 ? 192 : (255 - wallshade);
 
-                // calculate progress along x-axis via tx{0,1} so that walls
-                // which are partially cut off due to portal edges still have
-                // proper heights
+                // Calculate progress along x-axis via tx{0,1}
                 const f32 xp = ifnan((x - tx0) / (f32) txd, 0);
 
-                // get y coordinates for this x
+                // Get y coordinates for this x
                 const int
-                    tyf = (int) (xp * yfd) + yf0,
-                    tyc = (int) (xp * ycd) + yc0,
+                    tyf = (int)(xp * yfd) + yf0,
+                    tyc = (int)(xp * ycd) + yc0,
                     yf = clamp(tyf, state.y_lo[x], state.y_hi[x]),
                     yc = clamp(tyc, state.y_lo[x], state.y_hi[x]);
 
-                // floor
+                // Floor
                 if (yf > state.y_lo[x]) {
                     verline(
                         x,
@@ -406,7 +412,7 @@ static void render() {
                         0xFFFF0000);
                 }
 
-                // ceiling
+                // Ceiling
                 if (yc < state.y_hi[x]) {
                     verline(
                         x,
@@ -417,8 +423,8 @@ static void render() {
 
                 if (wall->portal) {
                     const int
-                        tnyf = (int) (xp * nyfd) + nyf0,
-                        tnyc = (int) (xp * nycd) + nyc0,
+                        tnyf = (int)(xp * nyfd) + nyf0,
+                        tnyc = (int)(xp * nycd) + nyc0,
                         nyf = clamp(tnyf, state.y_lo[x], state.y_hi[x]),
                         nyc = clamp(tnyc, state.y_lo[x], state.y_hi[x]);
 
@@ -638,29 +644,44 @@ int main(int argc, char *argv[]) {
         "SDL failed to initialize: %s\n",
         SDL_GetError());
 
-    state.screen = SDL_SetVideoMode(1280, 720, 32, SDL_SWSURFACE);
-
+    state.screen = SDL_SetVideoMode(640, 400, 32, SDL_SWSURFACE);
     ASSERT(state.screen, "Failed to set video mode: %s\n", SDL_GetError());
 
+    // Allocate memory for pixel buffer
     state.pixels = malloc(SCREEN_WIDTH * SCREEN_HEIGHT * 4);
+    ASSERT(state.pixels, "Failed to allocate memory for pixel buffer");
 
     SDL_WM_SetCaption("JDH Doom - SDL 1.2 Conversion", NULL);
 
+    const f32 base_look_speed = 1.5f * 0.04f;
     state.camera.pos = (v2) { 3, 3 };
     state.camera.angle = 0.0;
+    state.camera.pitch = 0.0f;
     state.camera.sector = 1;
+
+    Uint32 startTicks, frameTicks;
+    const int frameDelay = 1000 / FPS; // Target frame delay for 60 FPS
 
     int ret = 0;
     ASSERT(
         !(ret = load_sectors("level.txt")),
-        "error while loading sectors: %d\n",
+        "Error while loading sectors: %d\n",
         ret);
     printf(
-        "loaded %zu sectors with %zu walls\n",
+        "Loaded %zu sectors with %zu walls\n",
         state.sectors.n,
         state.walls.n);
 
     while (!state.quit) {
+        startTicks = SDL_GetTicks(); // Set start ticks for this frame
+
+        float cos_pitch = cosf(state.camera.pitch);
+        if (fabsf(cos_pitch) < 0.02f) {
+            cos_pitch = 0.02f;
+        }
+
+        f32 look_speed = base_look_speed * cos_pitch * cos_pitch;
+
         SDL_Event ev;
         while (SDL_PollEvent(&ev)) {
             switch (ev.type) {
@@ -679,11 +700,9 @@ int main(int argc, char *argv[]) {
         const f32 rot_speed = 3.0f * 0.016f, move_speed = 3.0f * 0.016f;
 
         const u8 *keystate = SDL_GetKeyState(NULL);
-
         if (keystate[SDLK_RIGHT]) {
             state.camera.angle -= rot_speed;
         }
-
         if (keystate[SDLK_LEFT]) {
             state.camera.angle += rot_speed;
         }
@@ -693,15 +712,33 @@ int main(int argc, char *argv[]) {
 
         // Compute movement vector
         v2 movement = {0, 0};
-
-        if (keystate[SDLK_UP]) {
+        if (keystate[SDLK_w]) {
             movement.x += move_speed * state.camera.anglecos;
             movement.y += move_speed * state.camera.anglesin;
         }
-
-        if (keystate[SDLK_DOWN]) {
+        if (keystate[SDLK_s]) {
             movement.x -= move_speed * state.camera.anglecos;
             movement.y -= move_speed * state.camera.anglesin;
+        }
+        if (keystate[SDLK_a]) {
+            movement.x += move_speed * cos(state.camera.angle + PI_2);
+            movement.y += move_speed * sin(state.camera.angle + PI_2);
+        }
+        if (keystate[SDLK_d]) {
+            movement.x -= move_speed * cos(state.camera.angle + PI_2);
+            movement.y -= move_speed * sin(state.camera.angle + PI_2);
+        }
+        if (keystate[SDLK_UP]) {
+            state.camera.pitch += look_speed;
+            if (state.camera.pitch > PI_2 + 0.1f) {
+                state.camera.pitch = PI_2 + 0.1f;
+            }
+        }
+        if (keystate[SDLK_DOWN]) {
+            state.camera.pitch -= look_speed;
+            if (state.camera.pitch < -PI_2 - 0.1f) {
+                state.camera.pitch = -PI_2 - 0.1f;
+            }
         }
 
         // Move the player with collision detection and wall sliding
@@ -710,10 +747,20 @@ int main(int argc, char *argv[]) {
         if (keystate[SDLK_F1]) {
             state.sleepy = true;
         }
+        
+        state.camera.anglecos = cos(state.camera.angle);
+        state.camera.anglesin = sin(state.camera.angle);
+        float pitchcos = cos(state.camera.pitch);
+        float pitchsin = sin(state.camera.pitch);
 
         memset(state.pixels, 0, SCREEN_WIDTH * SCREEN_HEIGHT * 4);
         render();
         if (!state.sleepy) { present(); }
+
+        frameTicks = SDL_GetTicks() - startTicks; // Calculate frame time
+        if (frameTicks < frameDelay) {
+            SDL_Delay(frameDelay - frameTicks); // Delay to cap FPS
+        }
     }
 
     free(state.pixels);
